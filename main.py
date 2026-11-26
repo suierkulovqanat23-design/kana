@@ -4,6 +4,11 @@ import framebuf
 import network
 from machine import I2C, Pin, time_pulse_us
 
+try:
+    from config import WIFI_SSID, WIFI_PASSWORD, API_URL, API_KEY
+except ImportError:
+    WIFI_SSID = WIFI_PASSWORD = API_URL = API_KEY = ""
+
 TRIG_PIN = 5
 ECHO_PIN = 18
 SDA_PIN = 21
@@ -14,10 +19,7 @@ DANGER_CM = 50
 WARNING_CM = 100
 MOTION_DELTA_CM = 2
 
-try:
-    from config import WIFI_SSID, WIFI_PASSWORD, API_URL, API_KEY
-except ImportError:
-    WIFI_SSID = WIFI_PASSWORD = API_URL = API_KEY = ""
+MOTION_VALUES = ("APPROACHING", "MOVING_AWAY", "STATIONARY")
 
 
 class OLED:
@@ -40,6 +42,7 @@ class OLED:
         self.frame.fill(0)
         for row, line in enumerate(lines):
             self.frame.text(line[:16], 0, row * 12, 1)
+
         self.command(0x21, 0, 127, 0x22, 0, 7)
         self.bus.writevto(OLED_ADDRESS, (b"\x40", self.buffer))
 
@@ -56,6 +59,9 @@ def measure_cm(trigger, echo):
     except OSError:
         return None
 
+    if duration <= 0:
+        return None
+
     distance = duration * 0.0343 / 2
     if 2 <= distance <= 400:
         return distance
@@ -65,9 +71,9 @@ def measure_cm(trigger, echo):
 def filtered_distance(trigger, echo):
     samples = []
     for _ in range(5):
-        measurement = measure_cm(trigger, echo)
-        if measurement is not None:
-            samples.append(measurement)
+        distance = measure_cm(trigger, echo)
+        if distance is not None:
+            samples.append(distance)
         time.sleep_ms(60)
 
     if len(samples) < 3:
@@ -93,6 +99,7 @@ def get_zone(distance):
 def local_motion(previous, current):
     if previous is None or current is None:
         return "UNKNOWN"
+
     delta = current - previous
     if delta < -MOTION_DELTA_CM:
         return "APPROACHING"
@@ -112,10 +119,11 @@ def request_motion(previous, current):
     )
     try:
         if response.status_code != 200:
-            raise ValueError("HTTP " + str(response.status_code))
+            raise ValueError("HTTP {}".format(response.status_code))
+
         data = response.json()
         motion = data.get("motion") if isinstance(data, dict) else None
-        if motion not in ("APPROACHING", "MOVING_AWAY", "STATIONARY"):
+        if motion not in MOTION_VALUES:
             raise ValueError("Invalid motion")
         return motion
     finally:
@@ -125,11 +133,15 @@ def request_motion(previous, current):
 def display_result(display, distance, zone, motion, source):
     if display is None:
         return
-    distance_text = "NO ECHO" if distance is None else "{:.1f} cm".format(distance)
+
+    distance_text = "NO ECHO"
+    if distance is not None:
+        distance_text = "{:.1f} cm".format(distance)
+
     try:
         display.show(("SMART PARKING", distance_text, zone, motion, source))
-    except OSError:
-        print("OLED update failed")
+    except OSError as error:
+        print("OLED update failed", error)
 
 
 def main():
@@ -138,19 +150,25 @@ def main():
 
     display = None
     try:
-        bus = I2C(0, sda=Pin(SDA_PIN), scl=Pin(SCL_PIN), freq=400000)
-        display = OLED(bus)
-    except (OSError, ValueError):
-        print("OLED initialization failed")
+        bus = I2C(0, sda=Pin(SDA_PIN), scl=Pin(SCL_PIN), freq=100000)
+        addresses = bus.scan()
+        if OLED_ADDRESS in addresses:
+            display = OLED(bus)
+        else:
+            print("OLED 0x3C not found. I2C addresses:",
+                  [hex(address) for address in addresses])
+    except (OSError, ValueError) as error:
+        print("OLED initialization failed", error)
 
     wifi = None
-    if WIFI_SSID:
+    api_enabled = bool(WIFI_SSID and API_URL and API_KEY)
+    if api_enabled:
         try:
             wifi = network.WLAN(network.STA_IF)
             wifi.active(True)
-        except OSError:
+        except OSError as error:
             wifi = None
-            print("Wi-Fi initialization failed")
+            print("Wi-Fi initialization failed", error)
 
     previous = None
     last_connect = None
@@ -163,8 +181,8 @@ def main():
         source = "LOCAL"
         display_result(display, distance, zone, motion, source)
 
-        connected = False
         now = time.ticks_ms()
+        connected = False
         if wifi is not None:
             try:
                 connected = wifi.isconnected()
@@ -174,13 +192,11 @@ def main():
                 ):
                     last_connect = now
                     wifi.connect(WIFI_SSID, WIFI_PASSWORD)
-            except OSError:
-                print("Wi-Fi error")
+            except OSError as error:
+                print("Wi-Fi error", error)
 
         if (
             connected
-            and API_URL
-            and API_KEY
             and previous is not None
             and distance is not None
             and (
@@ -194,7 +210,7 @@ def main():
                 source = "API"
                 display_result(display, distance, zone, motion, source)
             except Exception as error:
-                print("API error:", type(error).__name__)
+                print("API error", error)
 
         print("distance_cm={} zone={} motion={} source={}".format(
             distance, zone, motion, source
