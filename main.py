@@ -220,3 +220,12 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
+WIFI_SSID = "Имя Wi-Fi"
+WIFI_PASSWORD = "Пароль Wi-Fi"
+API_URL = ""
+API_KEY = ""
