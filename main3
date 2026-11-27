@@ -1,537 +1,256 @@
 
-# MicroPython кітапханалары және RFID оқырманының драйвері.
+
 import time
-import json
-import os
-import network
-from machine import Pin, SoftI2C
-from mfrc522 import MFRC522
-
-# Микробағдарламада қолжетімді HTTP кітапханасын жүктейміз.
-try:
-    import urequests as requests
-except ImportError:
-    import requests
-
-# Уақытты синхрондау мен OLED дисплейі тиісті модульдер болса қолданылады.
-try:
-    import ntptime
-except ImportError:
-    ntptime = None
-
-try:
-    import ssd1306
-except ImportError:
-    ssd1306 = None
+from machine import ADC, Pin
+from neopixel import NeoPixel
 
 
+# 1. Баптаулар
 
-# RFID оқырманын SPI арқылы қосуға арналған GPIO нөмірлері.
-RFID_SCK = 18
-RFID_MOSI = 23
-RFID_MISO = 19
-RFID_CS = 5            
-RFID_RST = 27
+# Бұл GPIO нөмірлері оқу үлгісінен алынған. Стенд сұлбасымен салыстырыңыз.
+MQ2_ADC_PIN = 34
+WS2812_PIN = 18
+LED_COUNT = 1
 
+# Уақыт пен резервтік шекті тапсырмада берілген мәндерге ауыстырыңыз.
+# Шек пен өлшемдер АЦТ бірлігімен беріледі.
+WARMUP_S = 60
+DEFAULT_THRESHOLD = 2500
+ADC_MAX = 4095
 
-# OLED дисплейінің I²C желілері мен мекенжайы.
-OLED_SDA = 21
-OLED_SCL = 22
-OLED_ADDR = 0x3C
+CALIBRATION_SAMPLES = 25
+CALIBRATION_INTERVAL_MS = 200
+FILTER_SAMPLES = 9
+FILTER_INTERVAL_MS = 50
+MONITOR_INTERVAL_MS = 1000
 
-# --- Wi-Fi и API  
-# API_URL бос болса, API-ге сұрау жіберілмейді.
-WIFI_SSID = "YOUR_WIFI"
-WIFI_PASS = "YOUR_PASSWORD"
-API_URL = ""                    
-API_KEY = ""                    
-API_KEY_HEADER = "X-API-Key"    
-API_KEY_PREFIX = ""            
+# API_URL бос қалса, бағдарлама бірден резервтік шекті қолданады.
+WIFI_SSID = ""
+WIFI_PASSWORD = ""
+WIFI_TIMEOUT_MS = 10000
+
+# Өріс атаулары мен HTTP тақырыбын API сипаттамасына сай өзгертіңіз.
+API_URL = ""
+API_KEY = ""
+API_KEY_HEADER = "X-API-Key"
+API_KEY_PREFIX = ""
+API_BASELINE_FIELD = "baseline"
+API_THRESHOLD_FIELD = "threshold"
 API_TIMEOUT_S = 5
-# API жауабындағы тәуекел бағасы өрісінің ықтимал атаулары.
-RISK_FIELDS = ("risk", "risk_level", "risk_score", "score", "level")  
-MASK_UID_IN_API = False         
-TZ_OFFSET_H = 5
 
-#  Память карты 
-
-# Сектор кілті, аты-жөн блоктары, санауыш блогы және дерек жазылғанын білдіретін белгі.
-KEY_A = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]   
-NAME_BLOCKS = (4, 5)            
-COUNTER_BLOCK = 6               
-CARD_MAGIC = 0xA5               
-
-
-# Қызметкерлердің жергілікті тізімі. Сөздік кілті — картаның UID мәні.
-employees = {
-    "12:34:56:78": {"name": "Иванов Иван", "active": True},
-    "11:22:33:44": {"name": "Петров Петр", "active": True},
-    "AA:BB:CC:DD": {"name": "Сидоров Сидор", "active": False},   
+# WS2812 түстері RGB ретімен берілген.
+STATUS_COLORS = {
+    "WARMUP": (0, 0, 80),         # Көк — датчик қызуда
+    "CALIBRATION": (80, 50, 0),   # Сары — фон өлшеніп жатыр
+    "NORMAL": (0, 100, 0),       # Жасыл — қалыпты күй
+    "ALARM": (100, 0, 0),        # Қызыл — дабыл
+    "ERROR": (80, 0, 80),         # Күлгін — қате
 }
 
-# Журнал файлының көлем шегі, жедел жадтағы оқиғалар саны және нәтижені көрсету уақыты.
-LOG_FILE = "access_log.txt"
-LOG_MAX_BYTES = 30000
-LOG_KEEP_IN_RAM = 100
-RESULT_SHOW_MIN_S = 3           
-
-
-def now_str():
-    # Жыл 2024-тен ерте болса, құрылғы іске қосылғалы өткен секундтарды көрсетеміз.
-    t = time.time()
-    if time.localtime(t)[0] >= 2024:            
-        y, mo, d, h, mi, s = time.localtime(t + TZ_OFFSET_H * 3600)[:6]
-        return "%04d-%02d-%02d %02d:%02d:%02d" % (y, mo, d, h, mi, s)
-    return "T+%ds" % (time.ticks_ms() // 1000)
-
-
-# Аты-жөнді OLED дисплейіне шығару үшін кирилл әріптерін латыншаға ауыстыру кестесі.
-_TR = {
-    'а': 'a', 'б': 'b', 'в': 'v', 'г': 'g', 'д': 'd', 'е': 'e', 'ё': 'e', 'ж': 'zh',
-    'з': 'z', 'и': 'i', 'й': 'y', 'к': 'k', 'л': 'l', 'м': 'm', 'н': 'n', 'о': 'o',
-    'п': 'p', 'р': 'r', 'с': 's', 'т': 't', 'у': 'u', 'ф': 'f', 'х': 'kh', 'ц': 'ts',
-    'ч': 'ch', 'ш': 'sh', 'щ': 'shch', 'ъ': '', 'ы': 'y', 'ь': '', 'э': 'e', 'ю': 'yu',
-    'я': 'ya', 'ә': 'a', 'ғ': 'g', 'қ': 'k', 'ң': 'n', 'ө': 'o', 'ұ': 'u', 'ү': 'u',
-    'һ': 'h', 'і': 'i',
+STATE_NAMES = {
+    "NORMAL": "ҚАЛЫПТЫ",
+    "ALARM": "ДАБЫЛ",
+    "ERROR": "ҚАТЕ",
 }
 
 
-def translit(text):
-    # Әріпті ауыстырғанда оның бас не кіші әріп екенін ескереміз.
-    out = ""
-    for ch in text:
-        low = ch.lower()
-        if low in _TR:
-            t = _TR[low]
-            out += t.capitalize() if ch != low else t
-        else:
-            out += ch
-    return out
+# 2. Жарық индикациясы және өлшеу
+
+def show_status(pixels, status):
+    # Барлық жарықдиодқа бір түсті орнатып, деректі жолаққа жібереміз.
+    pixels.fill(STATUS_COLORS[status])
+    pixels.write()
 
 
-# Жедел жадтағы журнал және іске қосылғаннан бері тіркелген оқиғаның реттік нөмірі.
-access_log = []
-_seq = 0
+def read_gas(adc):
+    # MQ-2 датчигінің аналогтық шығысынан 12 биттік мәнді оқимыз.
+    return adc.read()
 
 
-def log_event(uid, name, result, reason="", count=None):
-    global _seq
-    _seq += 1
-    ev = {
-        "n": _seq,
-        "time": now_str(),
-        "uid": uid,
-        "name": name,
-        "result": result,         
-        "reason": reason,
-        "count": count,
-    }
-    # Жедел жадтағы журнал шегіне жеткенде ең ескі жазбаны өшіреміз.
-    access_log.append(ev)
-    if len(access_log) > LOG_KEEP_IN_RAM:
-        access_log.pop(0)
-    print("СОБЫТИЕ:", ev)
-    try:
-        # Файл көлемі шектен асса, жаңа жазба алдында оны .old атауымен сақтаймыз.
-        if LOG_FILE in os.listdir() and os.stat(LOG_FILE)[6] > LOG_MAX_BYTES:
-            try:
-                os.remove(LOG_FILE + ".old")
-            except OSError:
-                pass
-            os.rename(LOG_FILE, LOG_FILE + ".old")
-        with open(LOG_FILE, "a") as f:
-            f.write(json.dumps(ev) + "\n")
-    except Exception as e:
-        print("log file error:", e)
-    return ev
+def median(values):
+    # Медиана бір реттік секірулердің нәтижеге әсерін азайтады.
+    ordered = sorted(values)
+    return ordered[len(ordered) // 2]
 
 
-# 128×64 OLED дисплейін бағдарламалық I²C шинасы арқылы іске қосамыз.
-oled = None
-if ssd1306:
-    try:
-        _i2c = SoftI2C(scl=Pin(OLED_SCL), sda=Pin(OLED_SDA), freq=400000)
-        oled = ssd1306.SSD1306_I2C(128, 64, _i2c, OLED_ADDR)
-    except Exception as e:
-        print("OLED не найден:", e)
-        oled = None
+def calibrate(adc):
+    # Қыздыру аяқталған соң бөлменің қалыпты жағдайында фонды өлшейміз.
+    background = []
+    for index in range(CALIBRATION_SAMPLES):
+        value = read_gas(adc)
+        background.append(value)
+        print("Фондық өлшем %d: %d" % (index + 1, value))
+        time.sleep_ms(CALIBRATION_INTERVAL_MS)
+
+    return median(background)
 
 
-def show(*lines):
-    """До 6 строк по 16 символов. Только латиница (шрифт OLED)."""
-    # Дисплей болмаса да, хабарларды консольге шығарамыз.
-    for ln in lines:
-        print("OLED |", ln)
-    if not oled:
-        return
-    try:
-        oled.fill(0)
-        for i, ln in enumerate(lines[:6]):
-            oled.text(str(ln)[:16], 0, i * 10)
-        oled.show()
-    except Exception as e:
-        print("OLED error:", e)
+def filtered_read(adc):
+    # Алғашқы мән журналға жазылады және сүзгіге де беріледі.
+    raw = read_gas(adc)
+    samples = [raw]
+    for _ in range(FILTER_SAMPLES - 1):
+        time.sleep_ms(FILTER_INTERVAL_MS)
+        samples.append(read_gas(adc))
+
+    return raw, median(samples)
 
 
-def name_lines(name):
-    # Экранға әрқайсысы 16 таңбадан тұратын екі жолға дейін шығарамыз.
-    t = translit(name)
-    return [t[:16], t[16:32]] if len(t) > 16 else [t]
+# 3. Wi-Fi және API арқылы дабыл шегін алу
 
+def wifi_connect():
+    import network
 
-# Wi-Fi клиент режимінде жұмыс істейді.
-wlan = network.WLAN(network.STA_IF)
-
-
-def wifi_connect(timeout=10):
+    wlan = network.WLAN(network.STA_IF)
     wlan.active(True)
+
     if wlan.isconnected():
         return True
-    try:
-        wlan.connect(WIFI_SSID, WIFI_PASS)
-    except Exception as e:
-        print("wifi error:", e)
-        return False
-    # Күту уақыты біткенше қосылымды әр 200 мс сайын тексереміз.
-    t0 = time.ticks_ms()
+
+    wlan.connect(WIFI_SSID, WIFI_PASSWORD)
+    started_at = time.ticks_ms()
     while not wlan.isconnected():
-        if time.ticks_diff(time.ticks_ms(), t0) > timeout * 1000:
-            print("WIFI_FAIL")
+        # Wi-Fi қосылмаса, шексіз күтпейміз.
+        elapsed = time.ticks_diff(time.ticks_ms(), started_at)
+        if elapsed >= WIFI_TIMEOUT_MS:
             return False
         time.sleep_ms(200)
-    print("WIFI_OK", wlan.ifconfig()[0])
+
     return True
 
 
-def sync_time():
-    # Уақытты синхрондау үшін ntptime модулі мен Wi-Fi қосылымы қажет.
-    if ntptime and wlan.isconnected():
-        try:
-            ntptime.settime()
-            print("NTP_OK")
-        except Exception as e:
-            print("NTP_FAIL", e)
+def valid_threshold(value):
+    # Жауаптағы шек сан болуы және АЦТ диапазонына сыйуы керек.
+    return (
+        type(value) in (int, float)
+        and 1 <= value <= ADC_MAX
+    )
 
 
-def _uid_for_api(uid):
-    # UID жасыру қосылса, тек соңғы екі байтын көрсетеміз.
-    if MASK_UID_IN_API:
-        return "**:**:" + uid[-5:]
-    return uid
-
-
-def build_payload(current):
-    """Сводка журнала для API. Состав полей — УТОЧНИТЬ по конкурсному заданию."""
-    # Жедел жадтағы журналдан нәтижелерді және әр карта бойынша оқиғаларды санаймыз.
-    granted = denied = errors = 0
-    per_card = {}
-    for e in access_log:
-        if e["result"] == "GRANTED":
-            granted += 1
-        elif e["result"] == "DENIED":
-            denied += 1
-        else:
-            errors += 1
-        k = _uid_for_api(e["uid"])
-        per_card[k] = per_card.get(k, 0) + 1
-    # Сұрауға соңғы он жазбаға дейін қосамыз.
-    last = []
-    for e in access_log[-10:]:
-        last.append({
-            "n": e["n"], "time": e["time"], "uid": _uid_for_api(e["uid"]),
-            "result": e["result"], "reason": e["reason"], "count": e["count"],
-        })
-    return {
-        "device": "esp32-b2",
-        "current": {
-            "uid": _uid_for_api(current["uid"]),
-            "result": current["result"],
-            "reason": current["reason"],
-            "count": current["count"],
-        },
-        "summary": {
-            "total": len(access_log), "granted": granted,
-            "denied": denied, "errors": errors, "per_card": per_card,
-        },
-        "events": last,
-    }
-
-
-def extract_risk(d):
-    # Тәуекел бағасын алдымен белгілі кілттерден, кейін ішкі сөздіктерден іздейміз.
-    if not isinstance(d, dict):
-        return None
-    for k in RISK_FIELDS:
-        v = d.get(k)
-        if isinstance(v, (int, float, str)) and not isinstance(v, bool):
-            return v
-    for v in d.values():
-        if isinstance(v, dict):
-            r = extract_risk(v)
-            if r is not None:
-                return r
-    return None
-
-
-def request_risk(current_event):
-    """Возвращает оценку риска или None. Ошибка API НЕ влияет на решение о доступе."""
+def get_threshold_from_api(baseline):
     if not API_URL:
         return None
-    if not wlan.isconnected() and not wifi_connect(6):
-        print("API: нет Wi-Fi")
-        return None
-    r = None
+
+    response = None
     try:
-        # Жиынтықты JSON түрінде жібереміз, ал API кілті берілсе, оны HTTP тақырыбына қосамыз.
-        body = json.dumps(build_payload(current_event))
+        # HTTP кітапханасы тек API бапталған кезде қажет.
+        try:
+            import urequests as requests
+        except ImportError:
+            import requests
+
+        if not wifi_connect():
+            print("Wi-Fi қосылмады. Резервтік шек қолданылады.")
+            return None
+
+        import json
+
         headers = {"Content-Type": "application/json"}
         if API_KEY:
             headers[API_KEY_HEADER] = API_KEY_PREFIX + API_KEY
-        try:
-            r = requests.post(API_URL, data=body, headers=headers, timeout=API_TIMEOUT_S)
-        except TypeError:                       # старая прошивка без timeout
-            r = requests.post(API_URL, data=body, headers=headers)
-        if r.status_code not in (200, 201):
-            print("API_FAIL status", r.status_code)
+
+        # Баптаудағы өріс арқылы фондық деңгейді JSON түрінде жібереміз.
+        payload = {API_BASELINE_FIELD: baseline}
+        response = requests.post(
+            API_URL,
+            data=json.dumps(payload),
+            headers=headers,
+            timeout=API_TIMEOUT_S,
+        )
+
+        if not 200 <= response.status_code < 300:
+            print("API HTTP қатесі:", response.status_code)
             return None
-        risk = extract_risk(r.json())
-        if risk is None:
-            print("API_FAIL: поля риска нет в ответе")
-        return risk
-    except Exception as e:
-        print("API_FAIL", e)
+
+        answer = response.json()
+        threshold = answer.get(API_THRESHOLD_FIELD) if isinstance(answer, dict) else None
+        if not valid_threshold(threshold):
+            print("API жауабындағы дабыл шегі жарамсыз.")
+            return None
+
+        return threshold
+
+    except Exception as error:
+        print("API қатесі:", error)
         return None
+
     finally:
-        # Функциядан шығарда HTTP жауабын жабамыз.
-        if r:
+        # Сұрау сәтсіз аяқталса да, ашылған HTTP жауабын жабамыз.
+        if response is not None:
             try:
-                r.close()
-            except Exception:
-                pass
+                response.close()
+            except Exception as error:
+                print("HTTP жауабын жабу қатесі:", error)
 
 
-# Картамен жұмыс істеу кезінде туындайтын қателерге арналған ерекше жағдай.
-class CardError(Exception):
-    pass
+# 4. Өлшеу журналы және негізгі бағдарлама
 
-
-rdr = None
-
-
-def uid_str(raw):
-    # Тізімнен іздеу үшін UID-дің алғашқы төрт байтын мәтінге айналдырамыз.
-    return ":".join("%02X" % b for b in raw[:4])
-
-
-def read_uid():
-    # Алдымен картаның бар-жоғын тексеріп, кейін UID мәнін оқимыз.
-    stat, _ = rdr.request(rdr.REQIDL)
-    if stat != rdr.OK:
-        return None
-    stat, raw = rdr.anticoll()
-    if stat != rdr.OK:
-        return None
-    return raw
-
-
-def halt_card():
-    """Команда HLTA: карта «засыпает» и не отвечает, пока её не уберут."""
-    try:
-        buf = [0x50, 0x00]
-        buf += rdr._crc(buf)
-        rdr._tocard(0x0C, buf)
-    except Exception:
-        pass
-
-
-def wait_card_removed():
-    """Ждём, пока карту уберут из поля (3 подряд пустых опроса)."""
-    absent = 0
-    while absent < 3:
-        # REQALL сұрауына HALT күйіндегі карталар да жауап береді.
-        stat, _ = rdr.request(rdr.REQALL)       
-        if stat == rdr.OK:
-            absent = 0
-            s, raw = rdr.anticoll()
-            if s == rdr.OK and rdr.select_tag(raw) == rdr.OK:
-                halt_card()
-        else:
-            absent += 1
-        time.sleep_ms(80)
-
-
-def _check_block(addr):
-    
-    # Аты-жөн мен санауыш блоктарына ғана рұқсат береміз. Қызметтік блоктар қолданылмайды.
-    allowed = tuple(NAME_BLOCKS) + (COUNTER_BLOCK,)
-    if addr not in allowed or addr == 0 or addr % 4 == 3:
-        raise CardError("block %d запрещён" % addr)
-
-
-def read_block(addr):
-    # Блоктан дәл 16 байт қайтарамыз.
-    _check_block(addr)
-    d = rdr.read(addr)
-    if d is None or len(d) < 16:
-        raise CardError("read %d fail" % addr)
-    return bytes(d[:16])
-
-
-def write_block(addr, data):
-    # Жазу алдында блок мекенжайын, жазудан кейін нәтиже күйін тексереміз.
-    _check_block(addr)
-    if rdr.write(addr, list(data)) != rdr.OK:
-        raise CardError("write %d fail" % addr)
-
-
-def fit_name(name):
-    # UTF-8 пішіміндегі аты-жөн 32 байтқа сыйғанша соңғы таңбаларын алып тастаймыз.
-    while len(name.encode()) > 32:
-        name = name[:-1]
-    return name
-
-
-def read_card_data():
-    # Аты-жөнді екі блоктан құрап, соңындағы нөлдік байттарды алып тастаймыз.
-    nb = read_block(NAME_BLOCKS[0]) + read_block(NAME_BLOCKS[1])
-    try:
-        name = nb.rstrip(b"\x00").decode()
-    except Exception:
-        name = ""
-    # Белгі табылса, одан кейінгі төрт байттан санауышты оқимыз.
-    cb = read_block(COUNTER_BLOCK)
-    count = int.from_bytes(cb[1:5], "big") if cb[0] == CARD_MAGIC else 0
-    return name, count
-
-
-def write_card_data(name, count):
-    # Аты-жөнді нөлдік байттармен толықтырып, 16 байттан екі блокқа бөлеміз.
-    nb = fit_name(name).encode()
-    nb = nb + b"\x00" * (32 - len(nb))
-    write_block(NAME_BLOCKS[0], nb[:16])
-    write_block(NAME_BLOCKS[1], nb[16:])
-    # Санауыш блогына белгі, санның төрт байты және 11 нөлдік байт жазамыз.
-    write_block(COUNTER_BLOCK, bytes([CARD_MAGIC]) + count.to_bytes(4, "big") + bytes(11))
-
-
-def card_update(raw, name):
-    """Аутентификация -> чтение -> +1 к счётчику -> запись -> проверка. Возвращает новый счётчик."""
-    if rdr.select_tag(raw) != rdr.OK:
-        raise CardError("select fail")
-    try:
-        if rdr.auth(rdr.AUTHENT1A, COUNTER_BLOCK, KEY_A, raw) != rdr.OK:
-            raise CardError("auth fail")
-        _, old_count = read_card_data()
-        new_count = old_count + 1
-        write_card_data(name, new_count)
-        # Екі өрістің де дұрыс жазылғанын тексеру үшін картаны қайта оқимыз.
-        chk_name, chk_count = read_card_data()
-        if chk_name != fit_name(name) or chk_count != new_count:
-            raise CardError("verify fail")
-        return new_count
-    finally:
-        rdr.stop_crypto1()
-
-
-def process_card(raw):
-    uid = uid_str(raw)
-    print("Card detected, UID:", uid)
-    emp = employees.get(uid)
-
-    # Белгісіз немесе белсенді емес карталарға өтуге рұқсат бермейміз.
-    if emp is None:
-        log_event(uid, "UNKNOWN", "DENIED", "card not registered")
-        show("ACCESS DENIED", "Card not found", "UID:", uid)
-        print("Неизвестная карта. Чтобы добавить, внеси UID в employees:", uid)
-        return
-
-    if not emp.get("active", False):
-        log_event(uid, emp["name"], "DENIED", "card inactive")
-        show("ACCESS DENIED", "Card inactive", *name_lines(emp["name"]))
-        return
-
-    # Белсенді картадағы аты-жөн мен өту санауышын жаңартамыз.
-    name = emp["name"]
-    try:
-        count = card_update(raw, name)
-    except CardError as e:
-        log_event(uid, name, "ERROR", "card: %s" % e)
-        show("CARD ERROR", str(e), "Data not", "confirmed")
-        return
-
-    # Рұқсатты журналға жазып, экранға шығару үшін тәуекел бағасын сұраймыз.
-    ev = log_event(uid, name, "GRANTED", "", count)
-    show("ACCESS GRANTED", "Checking risk...", *name_lines(name))
-    risk = request_risk(ev)
-    risk_txt = "Risk: " + str(risk) if risk is not None else "Risk: N/A"
-    lines = ["ACCESS GRANTED"] + name_lines(name) + ["Passes: %d" % count, risk_txt]
-    if risk is None:
-        lines.append("(risk unavailable)")
-    show(*lines)
-
-
-def idle_screen():
-    # Күту экранында Wi-Fi күйі мен жедел жадтағы оқиғалар саны көрсетіледі.
-    show("B2 RFID ACCESS", "Present card...", "",
-         "WiFi: " + ("OK" if wlan.isconnected() else "--"),
-         "Events: %d" % len(access_log))
+def log_measurement(number, raw, filtered, baseline, threshold, source, state):
+    # Әр циклдің нәтижесі Thonny Shell терезесінде бір жолға шығады.
+    print(
+        "№%d | MQ-2: %s | Сүзгі: %s | Фон: %s | Шек: %s | "
+        "Көзі: %s | Күйі: %s"
+        % (number, raw, filtered, baseline, threshold, source, STATE_NAMES[state])
+    )
 
 
 def main():
-    global rdr
-    show("B2 RFID ACCESS", "Starting...")
+    pixels = NeoPixel(Pin(WS2812_PIN, Pin.OUT), LED_COUNT)
 
-    # Оқырманмен байланысты тексеру үшін RC522 нұсқа регистрін оқимыз.
     try:
-        rdr = MFRC522(RFID_SCK, RFID_MOSI, RFID_MISO, RFID_RST, RFID_CS)
-        ver = rdr._rreg(0x37)                    
-        print("RFID reader initialized, version 0x%02X" % ver)
-        if ver in (0x00, 0xFF):
-            show("RFID ERROR", "Reader no reply", "Check SPI/CS/RST", "and power")
-            raise RuntimeError("RC522 не отвечает (version=0x%02X)" % ver)
-    except RuntimeError:
-        raise
-    except Exception as e:
-        show("RFID ERROR", str(e))
-        raise
+        # ESP32-нің аналогтық кірісін 12 биттік режимге баптаймыз.
+        adc = ADC(Pin(MQ2_ADC_PIN))
+        adc.width(ADC.WIDTH_12BIT)
+        adc.atten(ADC.ATTN_11DB)
 
-    show("Wi-Fi...", WIFI_SSID)
-    if wifi_connect():
-        sync_time()
+        show_status(pixels, "WARMUP")
+        print("MQ-2 қыздырылып жатыр. Күту уақыты: %d с." % WARMUP_S)
+        time.sleep(WARMUP_S)
 
-    idle_screen()
-    result_at = None
+        show_status(pixels, "CALIBRATION")
+        print("Фондық өлшемдер жиналып жатыр.")
+        baseline = calibrate(adc)
+        print("Фондық деңгей:", baseline)
 
-    # Бір картаны қайта өңдемеу үшін оны оқырманнан алыстатқанша күтеміз.
+        # API жарамды шек бермесе, жергілікті резервтік мәнді аламыз.
+        threshold = get_threshold_from_api(baseline)
+        source = "API"
+        if threshold is None:
+            threshold = DEFAULT_THRESHOLD
+            source = "DEFAULT"
+
+        print("Дабыл шегі: %s | Көзі: %s" % (threshold, source))
+
+    except Exception as error:
+        show_status(pixels, "ERROR")
+        print("Іске қосу қатесі:", error)
+        return
+
+    number = 0
     while True:
+        number += 1
+        raw = "-"
+        filtered = "-"
+
         try:
-            raw = read_uid()
-            if raw:
-                process_card(raw)
-                result_at = time.ticks_ms()
-                halt_card()
-                wait_card_removed()              
-                
-                # Күту экранына оралмас бұрын нәтижені кемінде белгіленген уақыт көрсетеміз.
-                while time.ticks_diff(time.ticks_ms(), result_at) < RESULT_SHOW_MIN_S * 1000:
-                    time.sleep_ms(100)
-                idle_screen()
-                time.sleep_ms(300)
-            else:
-                time.sleep_ms(100)
-        except KeyboardInterrupt:
-            raise
-        except Exception as e:
-            # Жүйелік қатені журналға тіркеп, карталарды тексеруді жалғастырамыз.
-            print("SYSTEM_ERROR:", repr(e))
+            raw, filtered = filtered_read(adc)
+
+            # Сүзілген мән шектен асқанда қызыл дабыл жанады.
+            state = "ALARM" if filtered > threshold else "NORMAL"
+            show_status(pixels, state)
+
+        except Exception as error:
+            # Өлшеу қатесін көрсетіп, келесі циклде қайта өлшейміз.
+            state = "ERROR"
+            print("Өлшеу қатесі:", error)
             try:
-                log_event("-", "-", "ERROR", "system: %s" % e)
-                show("SYSTEM ERROR", str(e))
-                time.sleep(2)
-                idle_screen()
-            except Exception:
-                pass
+                show_status(pixels, state)
+            except Exception as led_error:
+                print("Жарық индикациясының қатесі:", led_error)
+
+        log_measurement(number, raw, filtered, baseline, threshold, source, state)
+        time.sleep_ms(MONITOR_INTERVAL_MS)
 
 
-main()
-
+if __name__ == "__main__":
+    main()
