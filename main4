@@ -1,16 +1,19 @@
 
+# MicroPython кітапханалары және RFID оқырманының драйвері.
 import time
 import json
 import os
 import network
-from machine import Pin, ADC, SoftI2C
+from machine import Pin, SoftI2C
+from mfrc522 import MFRC522
 
-# MicroPython-да бар HTTP кітапханасын қолданамыз
+# Микробағдарламада қолжетімді HTTP кітапханасын жүктейміз.
 try:
     import urequests as requests
 except ImportError:
     import requests
 
+# Уақытты синхрондау мен OLED дисплейі тиісті модульдер болса қолданылады.
 try:
     import ntptime
 except ImportError:
@@ -22,75 +25,114 @@ except ImportError:
     ssd1306 = None
 
 
-# PIR қозғалысты, LDR жарық деңгейін өлшейді
-PIR_PINS = [25, 33]         
-LDR_PINS = [34]           
-LDR_INVERT = False          
 
-LAMP_TYPE = "gpio"          
-LAMP_PIN = 26               
-LAMP_ACTIVE_HIGH = True     
-LAMP_PWM = False            
-WS_COUNT = 8                
+# RFID оқырманын SPI арқылы қосуға арналған GPIO нөмірлері.
+RFID_SCK = 18
+RFID_MOSI = 23
+RFID_MISO = 19
+RFID_CS = 5            
+RFID_RST = 27
 
+
+# OLED дисплейінің I²C желілері мен мекенжайы.
 OLED_SDA = 21
 OLED_SCL = 22
 OLED_ADDR = 0x3C
 
+# --- Wi-Fi и API  
+# API_URL бос болса, API-ге сұрау жіберілмейді.
 WIFI_SSID = "YOUR_WIFI"
 WIFI_PASS = "YOUR_PASSWORD"
-
-
-API_URL = ""                
-API_METHOD = "GET"          
-API_KEY = ""                
-API_KEY_HEADER = "X-API-Key"
-API_KEY_PREFIX = ""        
+API_URL = ""                    
+API_KEY = ""                    
+API_KEY_HEADER = "X-API-Key"    
+API_KEY_PREFIX = ""            
 API_TIMEOUT_S = 5
-API_REFRESH_S = 60
-THRESHOLD_UNITS = "percent"  
-
-
-TB_ENABLED = False
-TB_TOKEN = ""              
-TB_EVERY_S = 10
-
+# API жауабындағы тәуекел бағасы өрісінің ықтимал атаулары.
+RISK_FIELDS = ("risk", "risk_level", "risk_score", "score", "level")  
+MASK_UID_IN_API = False         
 TZ_OFFSET_H = 5
 
+#  Память карты 
 
-# Қосу мен өшіру шектері бөлек, сондықтан шам шек маңында жиі жыпылықтамайды
-LOCAL_CFG = {
-    "hold_time": 10,        
-    "dark_threshold": 30,   
-    "light_threshold": 45,  
-    "brightness": 100,      
-    "mode": "auto",         
+# Сектор кілті, аты-жөн блоктары, санауыш блогы және дерек жазылғанын білдіретін белгі.
+KEY_A = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]   
+NAME_BLOCKS = (4, 5)            
+COUNTER_BLOCK = 6               
+CARD_MAGIC = 0xA5               
+
+
+# Қызметкерлердің жергілікті тізімі. Сөздік кілті — картаның UID мәні.
+employees = {
+    "12:34:56:78": {"name": "Иванов Иван", "active": True},
+    "11:22:33:44": {"name": "Петров Петр", "active": True},
+    "AA:BB:CC:DD": {"name": "Сидоров Сидор", "active": False},   
 }
-MODES = ("auto", "always_on", "always_off")
-FALLBACK_TO_LOCAL = True    
 
-LOG_FILE = "log.txt"
-LOG_MAX_BYTES = 20000
-CALIB_FILE = "calib.json"
-LOG_LDR_EVERY_S = 30        
-
-cfg = dict(LOCAL_CFG)
+# Журнал файлының көлем шегі, жедел жадтағы оқиғалар саны және нәтижені көрсету уақыты.
+LOG_FILE = "access_log.txt"
+LOG_MAX_BYTES = 30000
+LOG_KEEP_IN_RAM = 100
+RESULT_SHOW_MIN_S = 3           
 
 
 def now_str():
+    # Жыл 2024-тен ерте болса, құрылғы іске қосылғалы өткен секундтарды көрсетеміз.
     t = time.time()
-    if time.localtime(t)[0] >= 2024:        
+    if time.localtime(t)[0] >= 2024:            
         y, mo, d, h, mi, s = time.localtime(t + TZ_OFFSET_H * 3600)[:6]
         return "%04d-%02d-%02d %02d:%02d:%02d" % (y, mo, d, h, mi, s)
-    # Сағат бапталмаса, іске қосылғалы өткен секундты көрсетеміз
     return "T+%ds" % (time.ticks_ms() // 1000)
 
 
-def log(event, info=""):
-    line = "%s | %s | %s" % (now_str(), event, info)
-    print(line)
+# Аты-жөнді OLED дисплейіне шығару үшін кирилл әріптерін латыншаға ауыстыру кестесі.
+_TR = {
+    'а': 'a', 'б': 'b', 'в': 'v', 'г': 'g', 'д': 'd', 'е': 'e', 'ё': 'e', 'ж': 'zh',
+    'з': 'z', 'и': 'i', 'й': 'y', 'к': 'k', 'л': 'l', 'м': 'm', 'н': 'n', 'о': 'o',
+    'п': 'p', 'р': 'r', 'с': 's', 'т': 't', 'у': 'u', 'ф': 'f', 'х': 'kh', 'ц': 'ts',
+    'ч': 'ch', 'ш': 'sh', 'щ': 'shch', 'ъ': '', 'ы': 'y', 'ь': '', 'э': 'e', 'ю': 'yu',
+    'я': 'ya', 'ә': 'a', 'ғ': 'g', 'қ': 'k', 'ң': 'n', 'ө': 'o', 'ұ': 'u', 'ү': 'u',
+    'һ': 'h', 'і': 'i',
+}
+
+
+def translit(text):
+    # Әріпті ауыстырғанда оның бас не кіші әріп екенін ескереміз.
+    out = ""
+    for ch in text:
+        low = ch.lower()
+        if low in _TR:
+            t = _TR[low]
+            out += t.capitalize() if ch != low else t
+        else:
+            out += ch
+    return out
+
+
+# Жедел жадтағы журнал және іске қосылғаннан бері тіркелген оқиғаның реттік нөмірі.
+access_log = []
+_seq = 0
+
+
+def log_event(uid, name, result, reason="", count=None):
+    global _seq
+    _seq += 1
+    ev = {
+        "n": _seq,
+        "time": now_str(),
+        "uid": uid,
+        "name": name,
+        "result": result,         
+        "reason": reason,
+        "count": count,
+    }
+    # Жедел жадтағы журнал шегіне жеткенде ең ескі жазбаны өшіреміз.
+    access_log.append(ev)
+    if len(access_log) > LOG_KEEP_IN_RAM:
+        access_log.pop(0)
+    print("СОБЫТИЕ:", ev)
     try:
-        # Журнал көлемі шектен асса, оны .old файлына ауыстырамыз
+        # Файл көлемі шектен асса, жаңа жазба алдында оны .old атауымен сақтаймыз.
         if LOG_FILE in os.listdir() and os.stat(LOG_FILE)[6] > LOG_MAX_BYTES:
             try:
                 os.remove(LOG_FILE + ".old")
@@ -98,33 +140,13 @@ def log(event, info=""):
                 pass
             os.rename(LOG_FILE, LOG_FILE + ".old")
         with open(LOG_FILE, "a") as f:
-            f.write(line + "\n")
+            f.write(json.dumps(ev) + "\n")
     except Exception as e:
-        print("log error:", e)
+        print("log file error:", e)
+    return ev
 
 
-pirs = [Pin(p, Pin.IN) for p in PIR_PINS]
-
-# Жарық датчиктерін аналог кіріске қосамыз
-ldrs = []
-for _p in LDR_PINS:
-    _a = ADC(Pin(_p))
-    _a.atten(ADC.ATTN_11DB)                
-    ldrs.append(_a)
-
-# Баптауға қарай шамды WS2812, PWM немесе GPIO арқылы басқарамыз
-_ws = None
-_gpio = None
-_pwm = None
-if LAMP_TYPE == "ws2812":
-    import neopixel
-    _ws = neopixel.NeoPixel(Pin(LAMP_PIN), WS_COUNT)
-elif LAMP_PWM:
-    from machine import PWM
-    _pwm = PWM(Pin(LAMP_PIN), freq=1000, duty=0)
-else:
-    _gpio = Pin(LAMP_PIN, Pin.OUT)
-
+# 128×64 OLED дисплейін бағдарламалық I²C шинасы арқылы іске қосамыз.
 oled = None
 if ssd1306:
     try:
@@ -136,11 +158,14 @@ if ssd1306:
 
 
 def show(*lines):
+    """До 6 строк по 16 символов. Только латиница (шрифт OLED)."""
+    # Дисплей болмаса да, хабарларды консольге шығарамыз.
+    for ln in lines:
+        print("OLED |", ln)
     if not oled:
         return
     try:
         oled.fill(0)
-        # Экранға алты жолға дейін, әр жолға 16 таңба шығарамыз
         for i, ln in enumerate(lines[:6]):
             oled.text(str(ln)[:16], 0, i * 10)
         oled.show()
@@ -148,318 +173,136 @@ def show(*lines):
         print("OLED error:", e)
 
 
-def lamp_set(on):
-    level = cfg["brightness"] if on else 0
-    if _ws is not None:
-        v = int(255 * level / 100)
-        color = (v, int(v * 0.8), int(v * 0.5))
-        for i in range(WS_COUNT):
-            _ws[i] = color
-        _ws.write()
-    elif _pwm is not None:
-        duty = int(1023 * level / 100)
-        _pwm.duty(duty if LAMP_ACTIVE_HIGH else 1023 - duty)
-    else:
-        _gpio.value(1 if (on == LAMP_ACTIVE_HIGH) else 0)
+def name_lines(name):
+    # Экранға әрқайсысы 16 таңбадан тұратын екі жолға дейін шығарамыз.
+    t = translit(name)
+    return [t[:16], t[16:32]] if len(t) > 16 else [t]
 
 
-def read_raw():
-    """Среднее по датчикам света (0..4095), с учётом инверсии."""
-    total = 0
-    n = 0
-    # Бір өлшемге сүйенбей, әр датчикті 16 рет оқимыз
-    for a in ldrs:
-        for _ in range(16):
-            total += a.read()
-            n += 1
-    raw = total / n
-    return 4095 - raw if LDR_INVERT else raw
-
-
-def motion():
-    # Бір PIR іске қосылса, қозғалыс бар деп есептейміз
-    for p in pirs:
-        if p.value():
-            return True
-    return False
-
-
-calib = {"dark": 300, "light": 3000}
-
-
-def measure(seconds):
-    end = time.ticks_add(time.ticks_ms(), seconds * 1000)
-    s = 0
-    n = 0
-    while time.ticks_diff(end, time.ticks_ms()) > 0:
-        s += read_raw()
-        n += 1
-        time.sleep_ms(50)
-    return s / n
-
-
-def raw_for_pct(p):
-    return int(calib["dark"] + (calib["light"] - calib["dark"]) * p / 100)
-
-
-def pct_for_raw(r):
-    # Қараңғыдағы өлшем — 0%, жарықтағы өлшем — 100%
-    span = calib["light"] - calib["dark"]
-    if span <= 0:
-        return 100
-    return max(0, min(100, int((r - calib["dark"]) * 100 / span)))
-
-
-def log_calib_table():
-    log("CALIB_TABLE", "bright=%d dark=%d | ON thr=%d (<%d%%) OFF thr=%d (>%d%%)" % (
-        calib["light"], calib["dark"],
-        raw_for_pct(cfg["dark_threshold"]), cfg["dark_threshold"],
-        raw_for_pct(cfg["light_threshold"]), cfg["light_threshold"]))
-
-
-def calibrate():
-    # Датчикті алдымен жауып, сосын ашып өлшейміз
-    log("CALIB_START")
-    for i in range(3, 0, -1):
-        show("CALIBRATION", "Cover the light", "sensor with hand", "in %d..." % i)
-        time.sleep(1)
-    show("Measuring DARK", "hold...")
-    dark = measure(3)
-    for i in range(3, 0, -1):
-        show("CALIBRATION", "Uncover sensor", "(normal light)", "in %d..." % i)
-        time.sleep(1)
-    show("Measuring LIGHT", "hold...")
-    light = measure(3)
-    # Айырмасы 100-ден аз болса, жаңа өлшемдерді сақтамаймыз
-    if light - dark < 100:
-        log("CALIB_FAIL", "dark=%d light=%d (разница мала; проверь датчик/LDR_INVERT)" % (dark, light))
-        return False
-    calib["dark"], calib["light"] = dark, light
-    try:
-        with open(CALIB_FILE, "w") as f:
-            json.dump(calib, f)
-    except Exception as e:
-        print("calib save error:", e)
-    log("CALIB_OK", "dark=%d light=%d" % (dark, light))
-    return True
-
-
-def load_calib():
-    try:
-        with open(CALIB_FILE) as f:
-            d = json.load(f)
-        calib["dark"], calib["light"] = d["dark"], d["light"]
-        return True
-    except Exception:
-        return False
-
-
-def light_percent():
-    return pct_for_raw(read_raw())
-
-
+# Wi-Fi клиент режимінде жұмыс істейді.
 wlan = network.WLAN(network.STA_IF)
 
 
-def wifi_connect(timeout=15):
+def wifi_connect(timeout=10):
     wlan.active(True)
     if wlan.isconnected():
         return True
     try:
         wlan.connect(WIFI_SSID, WIFI_PASS)
     except Exception as e:
-        log("WIFI_FAIL", str(e))
+        print("wifi error:", e)
         return False
-    # Wi-Fi қосылғанша немесе күту уақыты біткенше тексереміз
+    # Күту уақыты біткенше қосылымды әр 200 мс сайын тексереміз.
     t0 = time.ticks_ms()
     while not wlan.isconnected():
         if time.ticks_diff(time.ticks_ms(), t0) > timeout * 1000:
-            log("WIFI_FAIL", "timeout")
+            print("WIFI_FAIL")
             return False
         time.sleep_ms(200)
-    log("WIFI_OK", wlan.ifconfig()[0])
+    print("WIFI_OK", wlan.ifconfig()[0])
     return True
 
 
 def sync_time():
+    # Уақытты синхрондау үшін ntptime модулі мен Wi-Fi қосылымы қажет.
     if ntptime and wlan.isconnected():
         try:
             ntptime.settime()
-            log("NTP_OK")
+            print("NTP_OK")
         except Exception as e:
-            log("NTP_FAIL", str(e))
+            print("NTP_FAIL", e)
 
 
-def _find(d, keys):
-    for k in keys:
-        if k in d:
-            return d[k]
+def _uid_for_api(uid):
+    # UID жасыру қосылса, тек соңғы екі байтын көрсетеміз.
+    if MASK_UID_IN_API:
+        return "**:**:" + uid[-5:]
+    return uid
+
+
+def build_payload(current):
+    """Сводка журнала для API. Состав полей — УТОЧНИТЬ по конкурсному заданию."""
+    # Жедел жадтағы журналдан нәтижелерді және әр карта бойынша оқиғаларды санаймыз.
+    granted = denied = errors = 0
+    per_card = {}
+    for e in access_log:
+        if e["result"] == "GRANTED":
+            granted += 1
+        elif e["result"] == "DENIED":
+            denied += 1
+        else:
+            errors += 1
+        k = _uid_for_api(e["uid"])
+        per_card[k] = per_card.get(k, 0) + 1
+    # Сұрауға соңғы он жазбаға дейін қосамыз.
+    last = []
+    for e in access_log[-10:]:
+        last.append({
+            "n": e["n"], "time": e["time"], "uid": _uid_for_api(e["uid"]),
+            "result": e["result"], "reason": e["reason"], "count": e["count"],
+        })
+    return {
+        "device": "esp32-b2",
+        "current": {
+            "uid": _uid_for_api(current["uid"]),
+            "result": current["result"],
+            "reason": current["reason"],
+            "count": current["count"],
+        },
+        "summary": {
+            "total": len(access_log), "granted": granted,
+            "denied": denied, "errors": errors, "per_card": per_card,
+        },
+        "events": last,
+    }
+
+
+def extract_risk(d):
+    # Тәуекел бағасын алдымен белгілі кілттерден, кейін ішкі сөздіктерден іздейміз.
+    if not isinstance(d, dict):
+        return None
+    for k in RISK_FIELDS:
+        v = d.get(k)
+        if isinstance(v, (int, float, str)) and not isinstance(v, bool):
+            return v
+    for v in d.values():
+        if isinstance(v, dict):
+            r = extract_risk(v)
+            if r is not None:
+                return r
     return None
 
 
-def _to_pct(v):
-    """Порог из API -> проценты (если API присылает «сырые» значения LDR)."""
-    if THRESHOLD_UNITS == "raw":
-        return pct_for_raw(v)
-    return v
-
-
-def parse_params(data):
-    """Возвращает (params, error). params — только проверенные значения."""
-    if not isinstance(data, dict):
-        return None, "ответ не JSON-объект"
-    # Кейде жуйе жауаптың ішкі бөлімінде келеді
-    for k in ("data", "config", "params", "settings", "recommendation"):
-        if isinstance(data.get(k), dict):
-            data = data[k]
-            break
-    params = {}
-
-    # Келген мәндерді санға айналдырып тиісті аралықта тұрғанын тексереміз
-    v = _find(data, ("hold_time", "hold_seconds", "hold", "timeout", "delay"))
-    if v is not None:
-        try:
-            v = int(float(v))
-        except (TypeError, ValueError):
-            return None, "hold_time не число"
-        if not 1 <= v <= 3600:
-            return None, "hold_time вне диапазона 1..3600"
-        params["hold_time"] = v
-
-    v = _find(data, ("dark_threshold", "on_threshold", "threshold", "light_threshold_on"))
-    if v is not None:
-        try:
-            v = int(_to_pct(float(v)))
-        except (TypeError, ValueError):
-            return None, "dark_threshold не число"
-        if not 1 <= v <= 99:
-            return None, "dark_threshold вне диапазона"
-        params["dark_threshold"] = v
-
-    v = _find(data, ("light_threshold", "off_threshold", "light_threshold_off"))
-    if v is not None:
-        try:
-            v = int(_to_pct(float(v)))
-        except (TypeError, ValueError):
-            return None, "light_threshold не число"
-        if not 1 <= v <= 99:
-            return None, "light_threshold вне диапазона"
-        params["light_threshold"] = v
-
-    v = _find(data, ("brightness", "level", "intensity"))
-    if v is not None:
-        try:
-            v = int(float(v))
-        except (TypeError, ValueError):
-            return None, "brightness не число"
-        if not 0 <= v <= 100:
-            return None, "brightness вне диапазона 0..100"
-        params["brightness"] = v
-
-    v = _find(data, ("mode", "lighting_mode", "profile"))
-    if v is not None:
-        v = str(v).lower()
-        if v not in MODES:
-            return None, "неизвестный режим '%s'" % v
-        params["mode"] = v
-
-    if not params:
-        return None, "нужных параметров в ответе нет"
-
-    # Өшіру шегі қосу шегінен жоғары болуы керек
-    on_t = params.get("dark_threshold", cfg["dark_threshold"])
-    off_t = params.get("light_threshold", cfg["light_threshold"])
-    if off_t <= on_t:
-        return None, "порог выключения должен быть выше порога включения"
-    return params, None
-
-
-def use_local(reason):
-    if FALLBACK_TO_LOCAL and cfg != LOCAL_CFG:
-        cfg.clear()
-        cfg.update(LOCAL_CFG)
-        log("API_FALLBACK", "локальные параметры (%s)" % reason)
-    else:
-        log("API_FALLBACK", reason)
-
-
-def api_fetch(state=None):
+def request_risk(current_event):
+    """Возвращает оценку риска или None. Ошибка API НЕ влияет на решение о доступе."""
     if not API_URL:
-        return
-    if not wlan.isconnected() and not wifi_connect(8):
-        use_local("нет Wi-Fi")
-        return
+        return None
+    if not wlan.isconnected() and not wifi_connect(6):
+        print("API: нет Wi-Fi")
+        return None
     r = None
     try:
-        headers = {}
+        # Жиынтықты JSON түрінде жібереміз, ал API кілті берілсе, оны HTTP тақырыбына қосамыз.
+        body = json.dumps(build_payload(current_event))
+        headers = {"Content-Type": "application/json"}
         if API_KEY:
             headers[API_KEY_HEADER] = API_KEY_PREFIX + API_KEY
-        # POST сұрауымен құрылғының қазіргі күйін де жібереміз
-        if API_METHOD == "POST":
-            headers["Content-Type"] = "application/json"
-            body = json.dumps(state or {})
-            try:
-                r = requests.post(API_URL, data=body, headers=headers, timeout=API_TIMEOUT_S)
-            except TypeError:
-                r = requests.post(API_URL, data=body, headers=headers)
-        else:
-            try:
-                r = requests.get(API_URL, headers=headers, timeout=API_TIMEOUT_S)
-            except TypeError:
-                r = requests.get(API_URL, headers=headers)
-        if r.status_code != 200:
-            use_local("HTTP %d" % r.status_code)
-            return
-        params, err = parse_params(r.json())
-        if err:
-            log("API_INVALID", err)
-            use_local(err)
-            return
-        cfg.clear()
-        cfg.update(LOCAL_CFG)                 
-        cfg.update(params)
-        log("API_OK", "hold=%ds dark<%d%% light>%d%% bright=%d%% mode=%s" % (
-            cfg["hold_time"], cfg["dark_threshold"], cfg["light_threshold"],
-            cfg["brightness"], cfg["mode"]))
-        log_calib_table()
-    except Exception as e:
-        log("API_FAIL", str(e))
-        use_local("ошибка сети")
-    finally:
-        if r:
-            try:
-                r.close()
-            except Exception:
-                pass
-
-
-_tb = {"next": 0, "fails": 0}
-
-
-def tb_send(raw, pct, lamp, mov, now):
-    # Жіберу уақыты келсе ғана жарық, шам және қозғалыс деректерін жібереміз.
-    if not TB_ENABLED or not TB_TOKEN or time.ticks_diff(now, _tb["next"]) < 0:
-        return
-    if not wlan.isconnected():
-        _tb["next"] = time.ticks_add(now, 15000)
-        return
-    r = None
-    try:
-        url = "http://thingsboard.cloud/api/v1/%s/telemetry" % TB_TOKEN
-        body = json.dumps({"ldr": int(raw), "light_pct": pct, "led1": bool(lamp), "motion": bool(mov)})
-        headers = {"Content-Type": "application/json"}
         try:
-            r = requests.post(url, data=body, headers=headers, timeout=3)
-        except TypeError:
-            r = requests.post(url, data=body, headers=headers)
-        _tb["fails"] = 0 if r.status_code == 200 else _tb["fails"] + 1
-        _tb["next"] = time.ticks_add(now, TB_EVERY_S * 1000)
+            r = requests.post(API_URL, data=body, headers=headers, timeout=API_TIMEOUT_S)
+        except TypeError:                       # старая прошивка без timeout
+            r = requests.post(API_URL, data=body, headers=headers)
+        if r.status_code not in (200, 201):
+            print("API_FAIL status", r.status_code)
+            return None
+        risk = extract_risk(r.json())
+        if risk is None:
+            print("API_FAIL: поля риска нет в ответе")
+        return risk
     except Exception as e:
-        _tb["fails"] += 1
-        if _tb["fails"] == 1:
-            log("TB_FAIL", str(e))
-        _tb["next"] = time.ticks_add(now, 60000 if _tb["fails"] >= 3 else TB_EVERY_S * 1000)
+        print("API_FAIL", e)
+        return None
     finally:
+        # Функциядан шығарда HTTP жауабын жабамыз.
         if r:
             try:
                 r.close()
@@ -467,155 +310,228 @@ def tb_send(raw, pct, lamp, mov, now):
                 pass
 
 
-st = {"lamp": False, "off_at": 0, "offset": 0, "dark": False}
+# Картамен жұмыс істеу кезінде туындайтын қателерге арналған ерекше жағдай.
+class CardError(Exception):
+    pass
 
 
-def lamp_on(now, pct, reason):
-    lamp_set(True)
-    st["lamp"] = True
-    st["off_at"] = time.ticks_add(now, cfg["hold_time"] * 1000)
-
-    time.sleep_ms(300)
-    st["offset"] = max(0, light_percent() - pct)
-    log("LAMP", "ON (%s) HOLD TIME: %d sec, self-light %d%%" % (reason, cfg["hold_time"], st["offset"]))
+rdr = None
 
 
-def lamp_off(reason):
-    lamp_set(False)
-    st["lamp"] = False
-    st["offset"] = 0
-    log("LAMP", "OFF (%s)" % reason)
+def uid_str(raw):
+    # Тізімнен іздеу үшін UID-дің алғашқы төрт байтын мәтінге айналдырамыз.
+    return ":".join("%02X" % b for b in raw[:4])
 
 
-def step(now, pct, mov):
-    """Один шаг алгоритма: pct — освещённость %, mov — есть ли движение."""
-    mode = cfg["mode"]
+def read_uid():
+    # Алдымен картаның бар-жоғын тексеріп, кейін UID мәнін оқимыз.
+    stat, _ = rdr.request(rdr.REQIDL)
+    if stat != rdr.OK:
+        return None
+    stat, raw = rdr.anticoll()
+    if stat != rdr.OK:
+        return None
+    return raw
 
-    # Тұрақты режимде датчиктердің көрсеткіші шамның күйін өзгертпейді.
-    if mode == "always_off":
-        if st["lamp"]:
-            lamp_off("mode always_off")
+
+def halt_card():
+    """Команда HLTA: карта «засыпает» и не отвечает, пока её не уберут."""
+    try:
+        buf = [0x50, 0x00]
+        buf += rdr._crc(buf)
+        rdr._tocard(0x0C, buf)
+    except Exception:
+        pass
+
+
+def wait_card_removed():
+    """Ждём, пока карту уберут из поля (3 подряд пустых опроса)."""
+    absent = 0
+    while absent < 3:
+        # REQALL сұрауына HALT күйіндегі карталар да жауап береді.
+        stat, _ = rdr.request(rdr.REQALL)       
+        if stat == rdr.OK:
+            absent = 0
+            s, raw = rdr.anticoll()
+            if s == rdr.OK and rdr.select_tag(raw) == rdr.OK:
+                halt_card()
+        else:
+            absent += 1
+        time.sleep_ms(80)
+
+
+def _check_block(addr):
+    
+    # Аты-жөн мен санауыш блоктарына ғана рұқсат береміз. Қызметтік блоктар қолданылмайды.
+    allowed = tuple(NAME_BLOCKS) + (COUNTER_BLOCK,)
+    if addr not in allowed or addr == 0 or addr % 4 == 3:
+        raise CardError("block %d запрещён" % addr)
+
+
+def read_block(addr):
+    # Блоктан дәл 16 байт қайтарамыз.
+    _check_block(addr)
+    d = rdr.read(addr)
+    if d is None or len(d) < 16:
+        raise CardError("read %d fail" % addr)
+    return bytes(d[:16])
+
+
+def write_block(addr, data):
+    # Жазу алдында блок мекенжайын, жазудан кейін нәтиже күйін тексереміз.
+    _check_block(addr)
+    if rdr.write(addr, list(data)) != rdr.OK:
+        raise CardError("write %d fail" % addr)
+
+
+def fit_name(name):
+    # UTF-8 пішіміндегі аты-жөн 32 байтқа сыйғанша соңғы таңбаларын алып тастаймыз.
+    while len(name.encode()) > 32:
+        name = name[:-1]
+    return name
+
+
+def read_card_data():
+    # Аты-жөнді екі блоктан құрап, соңындағы нөлдік байттарды алып тастаймыз.
+    nb = read_block(NAME_BLOCKS[0]) + read_block(NAME_BLOCKS[1])
+    try:
+        name = nb.rstrip(b"\x00").decode()
+    except Exception:
+        name = ""
+    # Белгі табылса, одан кейінгі төрт байттан санауышты оқимыз.
+    cb = read_block(COUNTER_BLOCK)
+    count = int.from_bytes(cb[1:5], "big") if cb[0] == CARD_MAGIC else 0
+    return name, count
+
+
+def write_card_data(name, count):
+    # Аты-жөнді нөлдік байттармен толықтырып, 16 байттан екі блокқа бөлеміз.
+    nb = fit_name(name).encode()
+    nb = nb + b"\x00" * (32 - len(nb))
+    write_block(NAME_BLOCKS[0], nb[:16])
+    write_block(NAME_BLOCKS[1], nb[16:])
+    # Санауыш блогына белгі, санның төрт байты және 11 нөлдік байт жазамыз.
+    write_block(COUNTER_BLOCK, bytes([CARD_MAGIC]) + count.to_bytes(4, "big") + bytes(11))
+
+
+def card_update(raw, name):
+    """Аутентификация -> чтение -> +1 к счётчику -> запись -> проверка. Возвращает новый счётчик."""
+    if rdr.select_tag(raw) != rdr.OK:
+        raise CardError("select fail")
+    try:
+        if rdr.auth(rdr.AUTHENT1A, COUNTER_BLOCK, KEY_A, raw) != rdr.OK:
+            raise CardError("auth fail")
+        _, old_count = read_card_data()
+        new_count = old_count + 1
+        write_card_data(name, new_count)
+        # Екі өрістің де дұрыс жазылғанын тексеру үшін картаны қайта оқимыз.
+        chk_name, chk_count = read_card_data()
+        if chk_name != fit_name(name) or chk_count != new_count:
+            raise CardError("verify fail")
+        return new_count
+    finally:
+        rdr.stop_crypto1()
+
+
+def process_card(raw):
+    uid = uid_str(raw)
+    print("Card detected, UID:", uid)
+    emp = employees.get(uid)
+
+    # Белгісіз немесе белсенді емес карталарға өтуге рұқсат бермейміз.
+    if emp is None:
+        log_event(uid, "UNKNOWN", "DENIED", "card not registered")
+        show("ACCESS DENIED", "Card not found", "UID:", uid)
+        print("Неизвестная карта. Чтобы добавить, внеси UID в employees:", uid)
         return
-    if mode == "always_on":
-        if not st["lamp"]:
-            lamp_on(now, pct, "mode always_on")
+
+    if not emp.get("active", False):
+        log_event(uid, emp["name"], "DENIED", "card inactive")
+        show("ACCESS DENIED", "Card inactive", *name_lines(emp["name"]))
         return
 
-    # --- auto ---
-    eff = pct - st["offset"] if st["lamp"] else pct        
-    if pct < cfg["dark_threshold"]:
-        st["dark"] = True
-    elif eff > cfg["light_threshold"]:
-        st["dark"] = False
+    # Белсенді картадағы аты-жөн мен өту санауышын жаңартамыз.
+    name = emp["name"]
+    try:
+        count = card_update(raw, name)
+    except CardError as e:
+        log_event(uid, name, "ERROR", "card: %s" % e)
+        show("CARD ERROR", str(e), "Data not", "confirmed")
+        return
 
-    # Қараңғыда қозғалыс болса, шам жанады. Қозғалыс жалғасса, таймер жаңарады.
-    if st["lamp"]:
-        if not st["dark"]:
-            lamp_off("became light")                       
-        elif mov:
-            st["off_at"] = time.ticks_add(now, cfg["hold_time"] * 1000)   
-        elif time.ticks_diff(now, st["off_at"]) >= 0:
-            lamp_off("no motion for %d sec" % cfg["hold_time"])
-    else:
-        if mov and st["dark"]:
-            lamp_on(now, pct, "dark + motion")
+    # Рұқсатты журналға жазып, экранға шығару үшін тәуекел бағасын сұраймыз.
+    ev = log_event(uid, name, "GRANTED", "", count)
+    show("ACCESS GRANTED", "Checking risk...", *name_lines(name))
+    risk = request_risk(ev)
+    risk_txt = "Risk: " + str(risk) if risk is not None else "Risk: N/A"
+    lines = ["ACCESS GRANTED"] + name_lines(name) + ["Passes: %d" % count, risk_txt]
+    if risk is None:
+        lines.append("(risk unavailable)")
+    show(*lines)
 
-# ---------------------------------------------------------------------
-#  MAIN
-# ---------------------------------------------------------------------
+
+def idle_screen():
+    # Күту экранында Wi-Fi күйі мен жедел жадтағы оқиғалар саны көрсетіледі.
+    show("B2 RFID ACCESS", "Present card...", "",
+         "WiFi: " + ("OK" if wlan.isconnected() else "--"),
+         "Events: %d" % len(access_log))
+
+
 def main():
-    lamp_set(False)
-    log("SYSTEM STARTED")
-    show("A2 Induction", "lamp v2", "Starting...")
+    global rdr
+    show("B2 RFID ACCESS", "Starting...")
+
+    # Оқырманмен байланысты тексеру үшін RC522 нұсқа регистрін оқимыз.
+    try:
+        rdr = MFRC522(RFID_SCK, RFID_MOSI, RFID_MISO, RFID_RST, RFID_CS)
+        ver = rdr._rreg(0x37)                    
+        print("RFID reader initialized, version 0x%02X" % ver)
+        if ver in (0x00, 0xFF):
+            show("RFID ERROR", "Reader no reply", "Check SPI/CS/RST", "and power")
+            raise RuntimeError("RC522 не отвечает (version=0x%02X)" % ver)
+    except RuntimeError:
+        raise
+    except Exception as e:
+        show("RFID ERROR", str(e))
+        raise
 
     show("Wi-Fi...", WIFI_SSID)
     if wifi_connect():
         sync_time()
 
-    # Сақталған өлшемдер болмаса немесе BOOT басылса, қайта калибрлейміз
-    boot_btn = Pin(0, Pin.IN, Pin.PULL_UP)
-    if not load_calib() or boot_btn.value() == 0:
-        calibrate()
-    else:
-        log("CALIB_LOADED", "dark=%d light=%d" % (calib["dark"], calib["light"]))
-    log_calib_table()
+    idle_screen()
+    result_at = None
 
-    api_fetch({"device": "esp32-a2", "ldr": int(read_raw()), "light_pct": light_percent(), "motion": motion()})
-    last_api = time.ticks_ms()
-
-    show("PIR warm-up...")
-    time.sleep(3)
-    log("SYSTEM READY")
-
-    last_mov = False
-    last_ldr_log = 0
-    last_oled = 0
-    last_status = None
-    bad_range = 0
-    bad_warned = False
-
-    # Әр айналымда датчиктерді оқып, шамның күйін жаңартамыз
+    # Бір картаны қайта өңдемеу үшін оны оқырманнан алыстатқанша күтеміз.
     while True:
-        now = time.ticks_ms()
-        raw = read_raw()
-        pct = pct_for_raw(raw)
-        mov = motion()
-
-        
-        if raw <= 5 or raw >= 4090:
-            bad_range += 1
-            if bad_range > 20 and not bad_warned:
-                bad_warned = True
-                log("SENSOR_ERROR", "LDR raw=%d (проверь провод/пин/питание)" % raw)
-        else:
-            bad_range = 0
-            bad_warned = False
-
-        if mov != last_mov:
-            log("PIR", "MOTION DETECTED" if mov else "NO MOTION")
-            last_mov = mov
-
-        step(now, pct, mov)
-
-        # Жарық күйі өзгерсе немесе уақыт аралығы өтсе, журналға жазамыз
-        status = "DARK" if st["dark"] else "LIGHT"
-        if status != last_status or time.ticks_diff(now, last_ldr_log) > LOG_LDR_EVERY_S * 1000:
-            log("LDR", "%d (%d%%) STATUS: %s" % (raw, pct, status))
-            last_status = status
-            last_ldr_log = now
-
-        if API_URL and time.ticks_diff(now, last_api) > API_REFRESH_S * 1000:
-            last_api = now
-            api_fetch({"device": "esp32-a2", "ldr": int(raw), "light_pct": pct, "motion": mov})
-            if st["lamp"]:
-                lamp_set(True)                              # применить новую яркость
-
-        tb_send(raw, pct, st["lamp"], mov, now)
-
-        # Экранды шамамен жарты секунд сайын жаңартамыз
-        if time.ticks_diff(now, last_oled) > 500:
-            last_oled = now
-            left = max(0, time.ticks_diff(st["off_at"], now) // 1000) if st["lamp"] else 0
-            show(
-                "LAMP: " + ("ON" if st["lamp"] else "OFF"),
-                "Light:%d%% %s" % (pct, status),
-                "On<%d Off>%d" % (cfg["dark_threshold"], cfg["light_threshold"]),
-                "Motion: " + ("YES" if mov else "NO"),
-                "Hold:%ds left %d" % (cfg["hold_time"], left),
-                "%s WiFi:%s" % (cfg["mode"][:8], "OK" if wlan.isconnected() else "--"),
-            )
-
-        time.sleep_ms(50)
+        try:
+            raw = read_uid()
+            if raw:
+                process_card(raw)
+                result_at = time.ticks_ms()
+                halt_card()
+                wait_card_removed()              
+                
+                # Күту экранына оралмас бұрын нәтижені кемінде белгіленген уақыт көрсетеміз.
+                while time.ticks_diff(time.ticks_ms(), result_at) < RESULT_SHOW_MIN_S * 1000:
+                    time.sleep_ms(100)
+                idle_screen()
+                time.sleep_ms(300)
+            else:
+                time.sleep_ms(100)
+        except KeyboardInterrupt:
+            raise
+        except Exception as e:
+            # Жүйелік қатені журналға тіркеп, карталарды тексеруді жалғастырамыз.
+            print("SYSTEM_ERROR:", repr(e))
+            try:
+                log_event("-", "-", "ERROR", "system: %s" % e)
+                show("SYSTEM ERROR", str(e))
+                time.sleep(2)
+                idle_screen()
+            except Exception:
+                pass
 
 
-if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        lamp_set(False)
-        log("STOP", "KeyboardInterrupt")
-    except Exception as e:
-        lamp_set(False)
-        log("CRASH", repr(e))
-        raise
+main()
 
