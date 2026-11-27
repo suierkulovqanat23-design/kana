@@ -1,0 +1,486 @@
+import json
+import time
+
+from machine import Pin, SoftI2C, UART
+
+
+# True — проверить OLED и счётчик без камеры.
+# False — принимать реальные данные через UART.
+DEMO_MODE = True
+
+OLED_SDA = 21
+OLED_SCL = 22
+
+UART_NUMBER = 2
+UART_RX = 16
+UART_TX = 17
+UART_BAUD = 115200
+
+MIN_CONFIDENCE = 0.75
+CONFIRM_FRAMES = 3
+LINK_TIMEOUT_MS = 3000
+MAX_PACKET_BYTES = 256
+
+WIFI_SSID = ""
+WIFI_PASSWORD = ""
+API_URL = ""
+API_KEY = ""
+API_KEY_HEADER = "X-API-Key"
+API_ID_FIELD = "id"
+API_NAME_FIELD = "name"
+
+# Добавь названия из таблицы классов своей модели.
+LOCAL_NAMES = {}
+LOG_FILE = "camera_log.jsonl"
+
+
+class Display:
+    """Минимальный драйвер SSD1306 128×64 для MicroPython."""
+
+    def __init__(self):
+        import framebuf
+
+        self.i2c = SoftI2C(
+            sda=Pin(OLED_SDA), scl=Pin(OLED_SCL), freq=100000
+        )
+
+        addresses = self.i2c.scan()
+        print("I2C:", [hex(address) for address in addresses])
+        self.address = next((a for a in (0x3C, 0x3D) if a in addresses), None)
+        if self.address is None:
+            raise OSError("OLED not found on I2C")
+
+        # 0x40 — служебный байт перед данными пикселей SSD1306.
+        self.data = bytearray(1 + 128 * 64 // 8)
+        self.data[0] = 0x40
+        self.buffer = framebuf.FrameBuffer(
+            memoryview(self.data)[1:], 128, 64, framebuf.MONO_VLSB
+        )
+        self.previous = None
+
+        # Включаем дисплей и горизонтальный режим адресации.
+        self.i2c.writeto(self.address, bytes((
+            0x00, 0xAE, 0xD5, 0x80, 0xA8, 0x3F, 0xD3, 0x00,
+            0x40, 0x8D, 0x14, 0x20, 0x00, 0xA1, 0xC8,
+            0xDA, 0x12, 0x81, 0x7F, 0xD9, 0xF1, 0xDB, 0x40,
+            0xA4, 0xA6, 0xAF,
+        )))
+
+    def show(self, *lines):
+        if lines == self.previous:
+            return
+
+        print(" | ".join(lines))
+        self.buffer.fill(0)
+        for row, line in enumerate(lines[:6]):
+            # Стандартный шрифт framebuf рассчитан на ASCII.
+            text = "".join(c if 32 <= ord(c) <= 126 else "?" for c in line)
+            self.buffer.text(text[:16], 0, row * 10, 1)
+
+        try:
+            self.i2c.writeto(self.address, b"\x00\x21\x00\x7f\x22\x00\x07")
+            self.i2c.writeto(self.address, self.data)
+            self.previous = lines
+        except OSError as error:
+            print("OLED write error:", error)
+
+
+class ConsoleDisplay:
+    """Если OLED не виден, результаты остаются доступны в Thonny."""
+
+    def __init__(self):
+        self.previous = None
+
+    def show(self, *lines):
+        if lines != self.previous:
+            print(" | ".join(lines))
+            self.previous = lines
+
+
+def save_event(event, **fields):
+    record = {"event": event, "uptime_ms": time.ticks_ms()}
+    record.update(fields)
+    try:
+        with open(LOG_FILE, "a") as file:
+            file.write(json.dumps(record) + "\n")
+    except OSError as error:
+        print("Log write error:", error)
+
+
+def load_counts():
+    # Восстанавливаем статистику из записей о распознаваниях.
+    counts = {}
+    try:
+        with open(LOG_FILE, "r") as file:
+            for line in file:
+                try:
+                    record = json.loads(line)
+                    if record.get("event") == "detection":
+                        key = str(record["id"])
+                        counts[key] = counts.get(key, 0) + 1
+                except (ValueError, KeyError, AttributeError):
+                    print("Skipped invalid log entry")
+    except OSError as error:
+        if not error.args or error.args[0] != 2:
+            print("Log read error:", error)
+    return counts
+
+
+def lookup_name(object_id):
+    fallback = LOCAL_NAMES.get(object_id, "ID " + object_id)
+    if not API_URL:
+        return fallback, "API: OFF"
+
+    response = None
+    try:
+        import network
+        try:
+            import requests
+        except ImportError:
+            import urequests as requests
+
+        wlan = network.WLAN(network.STA_IF)
+        wlan.active(True)
+        if not wlan.isconnected():
+            wlan.connect(WIFI_SSID, WIFI_PASSWORD)
+            started = time.ticks_ms()
+            while not wlan.isconnected():
+                if time.ticks_diff(time.ticks_ms(), started) >= 5000:
+                    raise OSError("Wi-Fi timeout")
+                time.sleep_ms(100)
+
+        headers = {"Content-Type": "application/json"}
+        if API_KEY:
+            headers[API_KEY_HEADER] = API_KEY
+
+        # При другом контракте API меняй запрос и разбор ответа здесь.
+        response = requests.post(
+            API_URL,
+            data=json.dumps({API_ID_FIELD: object_id}),
+            headers=headers,
+            timeout=3,
+        )
+        if not 200 <= response.status_code < 300:
+            raise ValueError("HTTP %d" % response.status_code)
+
+        result = response.json()
+        name = result.get(API_NAME_FIELD) if isinstance(result, dict) else None
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("Missing object name")
+        return name.strip(), "API: OK"
+
+    except Exception as error:
+        print("API error:", error)
+        save_event("api_error", id=object_id, detail=str(error))
+        return fallback, "API: ERROR"
+    finally:
+        if response is not None:
+            try:
+                response.close()
+            except OSError as error:
+                print("HTTP close error:", error)
+
+
+class Recognition:
+    """Подтверждает класс по серии кадров и считает его один раз."""
+
+    def __init__(self, display):
+        self.display = display
+        self.counts = {} if DEMO_MODE else load_counts()
+        self.total = sum(self.counts.values())
+        self.active = None
+        self.name = ""
+        self.api_status = ""
+        self.reset_series()
+
+    def reset_series(self):
+        self.candidate = None
+        self.matches = 0
+        self.empty_frames = 0
+
+    def show(self, message, link, confidence=None):
+        confidence_line = ""
+        if confidence is not None:
+            confidence_line = "Conf: %d%%" % round(confidence * 100)
+
+        class_line = ""
+        if confidence is not None and self.active is not None and message == self.name:
+            class_line = "Class: %d" % self.counts[self.active]
+
+        self.display.show(
+            "AI CAMERA SYSTEM",
+            message,
+            confidence_line,
+            "Total: %d" % self.total,
+            link,
+            " ".join(part for part in (class_line or self.api_status,) if part),
+        )
+
+    def accept(self, object_id, confidence, link):
+        if object_id is None or confidence < MIN_CONFIDENCE:
+            self.candidate = None
+            self.matches = 0
+            self.empty_frames += 1
+            if self.empty_frames >= CONFIRM_FRAMES:
+                self.active = None
+                self.api_status = ""
+                self.show("Place object", link)
+            return
+
+        self.empty_frames = 0
+        key = str(object_id)
+        if key != self.candidate:
+            self.candidate = key
+            self.matches = 0
+
+        self.matches = min(self.matches + 1, CONFIRM_FRAMES)
+        if self.matches < CONFIRM_FRAMES:
+            self.show("Checking...", link, confidence)
+            return
+
+        if key != self.active:
+            self.active = key
+            self.total += 1
+            self.counts[key] = self.counts.get(key, 0) + 1
+
+            if DEMO_MODE:
+                self.name, self.api_status = "DEMO OBJECT " + key, "API: OFF"
+            else:
+                self.name, self.api_status = lookup_name(key)
+                save_event(
+                    "detection", number=self.total, id=key,
+                    name=self.name, confidence=confidence,
+                    class_count=self.counts[key], api=self.api_status,
+                )
+            print("Class counts:", self.counts)
+
+        # Статус API показываем вместе со счётчиком и связью.
+        self.display.show(
+            "AI CAMERA SYSTEM",
+            self.name,
+            "Conf: %d%%" % round(confidence * 100),
+            "Total: %d" % self.total,
+            link,
+            self.api_status,
+        )
+
+
+def decode_packet(data):
+    # Формат линии: {"id":0,"confidence":0.96}\n
+    # При отсутствии объекта: {"id":null,"confidence":0}\n
+    message = json.loads(data.decode())
+    if not isinstance(message, dict):
+        raise ValueError("Expected JSON object")
+    if message.get("error"):
+        return None, 0, str(message["error"])
+
+    object_id = message["id"]
+    confidence = message["confidence"]
+    if object_id is not None and type(object_id) not in (int, str):
+        raise ValueError("Invalid object id")
+    if type(confidence) not in (int, float) or not 0 <= confidence <= 1:
+        raise ValueError("Invalid confidence")
+    return object_id, confidence, None
+
+
+def run_uart(recognition):
+    uart = UART(
+        UART_NUMBER, baudrate=UART_BAUD,
+        rx=Pin(UART_RX), tx=Pin(UART_TX),
+        timeout=0, rxbuf=4096,
+    )
+
+    packet = bytearray()
+    oversized = False
+    last_packet = time.ticks_ms()
+    timed_out = False
+    recognition.show("Waiting camera", "UART: WAIT")
+
+    while True:
+        data = uart.read(256) if uart.any() else None
+
+        for byte in data or b"":
+            if byte != 10:  # Конец JSON-пакета — символ новой строки.
+                if len(packet) < MAX_PACKET_BYTES:
+                    packet.append(byte)
+                else:
+                    oversized = True
+                continue
+
+            try:
+                if oversized:
+                    raise ValueError("Packet too long")
+                object_id, confidence, camera_error = decode_packet(bytes(packet))
+            except (ValueError, KeyError) as error:
+                recognition.reset_series()
+                recognition.show("Packet error", "UART: ERROR")
+                save_event("uart_error", detail=str(error))
+                continue
+            finally:
+                packet = bytearray()
+                oversized = False
+
+            timed_out = False
+            if camera_error:
+                recognition.reset_series()
+                recognition.show("Camera error", "UART: OK")
+                save_event("camera_error", detail=camera_error)
+            else:
+                recognition.accept(object_id, confidence, "UART: OK")
+
+            # Обновляем время после обработки, включая возможный запрос API.
+            last_packet = time.ticks_ms()
+
+        if not timed_out and time.ticks_diff(time.ticks_ms(), last_packet) >= LINK_TIMEOUT_MS:
+            recognition.reset_series()
+            recognition.show("No camera data", "UART: LOST")
+            save_event("uart_timeout")
+            timed_out = True
+            packet = bytearray()
+            oversized = False
+
+        time.sleep_ms(20)
+
+
+def run_demo(recognition):
+    # Класс 0 держится в кадре, исчезает и появляется снова.
+    # За каждый цикл он должен быть посчитан ровно один раз.
+    while True:
+        for object_id in (None, 0):
+            confidence = 0 if object_id is None else 0.96
+            for _ in range(CONFIRM_FRAMES + 3):
+                recognition.accept(object_id, confidence, "DEMO MODE")
+                time.sleep_ms(350)
+
+
+def main():
+    try:
+        display = Display()
+    except (ImportError, OSError, ValueError) as error:
+        print("OLED startup error:", error)
+        display = ConsoleDisplay()
+
+    display.show("AI CAMERA SYSTEM", "Starting...")
+    time.sleep_ms(700)
+
+    recognition = Recognition(display)
+    if DEMO_MODE:
+        run_demo(recognition)
+    else:
+        try:
+            run_uart(recognition)
+        except (OSError, ValueError) as error:
+            recognition.show("UART setup error", "See Thonny")
+            save_event("uart_setup_error", detail=str(error))
+            print("UART error:", error)
+
+
+if __name__ == "__main__":
+    main()
+    
+    
+    
+import time
+
+import sensor
+from fpioa_manager import fm
+from machine import UART
+
+try:
+    import ujson as json
+except ImportError:
+    import json
+
+
+DEMO_MODE = True
+
+# Номера физических IO камеры. Сверь с распиновкой A01-AI.
+CAMERA_UART_TX = 7
+CAMERA_UART_RX = 8
+UART_BAUD = 115200
+
+MODEL_PATH = "/sd/model.kmodel"
+
+# Вставь точные anchors из примера к выданной YOLOv2-модели.
+# Записываются парами: (ширина1, высота1, ширина2, высота2, ...).
+ANCHORS = ()
+DETECT_THRESHOLD = 0.50
+NMS_THRESHOLD = 0.30
+
+
+def open_uart():
+    fm.register(CAMERA_UART_TX, fm.fpioa.UART1_TX)
+    fm.register(CAMERA_UART_RX, fm.fpioa.UART1_RX)
+    return UART(UART.UART1, UART_BAUD, 8, None, 1)
+
+
+def send(uart, object_id=None, confidence=0, error=None):
+    # Один кадр — один JSON-пакет с переводом строки.
+    packet = {"id": object_id, "confidence": confidence}
+    if error:
+        packet["error"] = error[:100]
+    uart.write((json.dumps(packet) + "\n").encode())
+
+
+def run_demo(uart):
+    # Имитируем появление и исчезновение объекта.
+    while True:
+        for object_id in (None, 0):
+            confidence = 0 if object_id is None else 0.96
+            for _ in range(6):
+                send(uart, object_id, confidence)
+                time.sleep_ms(350)
+
+
+def run_model(uart):
+    import KPU as kpu
+
+    if len(ANCHORS) < 2 or len(ANCHORS) % 2:
+        raise ValueError("Set model ANCHORS first")
+
+    # QVGA — пример. Используй размер и формат из примера модели.
+    sensor.reset()
+    sensor.set_pixformat(sensor.RGB565)
+    sensor.set_framesize(sensor.QVGA)
+    sensor.skip_frames(time=1000)
+    sensor.run(1)
+
+    task = kpu.load(MODEL_PATH)
+    try:
+        kpu.init_yolo2(
+            task, DETECT_THRESHOLD, NMS_THRESHOLD, len(ANCHORS) // 2, ANCHORS
+        )
+
+        while True:
+            frame = sensor.snapshot()
+            objects = kpu.run_yolo2(task, frame)
+            if objects:
+                # На ESP32 отправляем объект с наибольшей уверенностью.
+                best = max(objects, key=lambda obj: obj.value())
+                send(uart, best.classid(), best.value())
+            else:
+                # Пустые кадры нужны для сброса текущего объекта на ESP32.
+                send(uart)
+
+            time.sleep_ms(100)
+    finally:
+        kpu.deinit(task)
+
+
+def main():
+    uart = open_uart()
+    if DEMO_MODE:
+        run_demo(uart)
+        return
+
+    try:
+        run_model(uart)
+    except Exception as error:
+        print("Camera error:", error)
+        while True:
+            send(uart, error=str(error))
+            time.sleep_ms(1000)
+
+
+if __name__ == "__main__":
+    main()
